@@ -1,0 +1,314 @@
+/**
+ * content.js - 内容页专用脚本
+ * 仅用于内容详情页，依赖：jquery, bootstrap.bundle, verify.js, sweetalert2, qrcodejs
+ * 必须在这些库之后加载
+ */
+$(function () {
+  /* ===== 截图放大 ===== */
+  $('[data-screenshot]').on('click', function (e) {
+    e.preventDefault();
+    var src = $(this).find('img').attr('src');
+    $('#screenshotLarge').attr('src', src);
+    new bootstrap.Modal('#screenshotModal').show();
+  });
+
+  /* ===== 下载 / 付费阅读 流程：行为验证码 → 后端二次验证 → 登录/支付/权限闸门 ===== */
+  var currentDataVal = '';          // 记录被点击按钮的 data-val
+  var currentPayMode = 'download';  // 'download'=付费下载；'read'=付费阅读
+  var payPollTimer = null;          // 支付结果轮询定时器（供关闭弹窗时清除）
+
+  $('.btn-download').on('click', function (e) {
+    e.preventDefault();
+    currentDataVal = $(this).data('val');   // jQuery 对象用 .data()，原 .dataset.val 会报 undefined
+    currentPayMode = 'download';
+    document.getElementById('captchaTrigger').click();
+  });
+
+  $('.btn-readfull').on('click', function (e) {
+    e.preventDefault();
+    currentDataVal = $(this).data('val');
+    currentPayMode = 'read';
+    document.getElementById('captchaTrigger').click();
+  });
+
+  $('#captchaBox').slideVerify({
+      baseUrl: window.SITE_URL + '/e/extend/captcha',
+      containerId: 'captchaTrigger',   // 指向已存在的隐藏触发按钮
+      mode: 'pop',
+      captchaType: 'blockPuzzle',
+      success: function (res) {
+          // res.captchaVerification 是一次验证下发的凭证，随请求带去后端做二次校验
+          var apiUrl = (currentPayMode === 'read')
+              ? '/e/extend/payread/index.php'
+              : '/e/extend/download/index.php';
+          $.ajax({
+              url: apiUrl,
+              type: 'post',
+              data: {
+                  captchaVerification: res.captchaVerification,
+                  dataval: currentDataVal,
+                  captchaType: 'blockPuzzle'
+              },
+              dataType: 'json'
+          }).done(function (resp) {
+              handleDownload(resp);
+          }).fail(function () {
+              Swal.fire({ icon: 'error', title: '请求失败', text: '请稍后重试' });
+          });
+      }
+  });
+
+  // 后端返回的统一闸门
+  function handleDownload(resp) {
+      // 仅前端视觉：同步会员中心显隐缓存（localStorage），真实登录以服务端校验为准
+      if (resp && resp.success) {
+          if (resp.action === 'login') {
+              localStorage.removeItem('isLogined');   // 未登录 → 删除
+          } else {
+              // download / pay / noperm 均代表已通过服务端登录校验
+              localStorage.setItem('isLogined', '1');  // 已登录 → 置 1
+          }
+          // 立即刷新会员中心入口显隐，无需刷新页面
+          if (typeof window.syncMemberCenterLink === 'function') {
+              window.syncMemberCenterLink();
+          }
+      }
+      if (!resp || !resp.success) {
+          Swal.fire({ icon: 'error', title: '提示', text: resp ? resp.msg : '请求异常' });
+          return;
+      }
+      switch (resp.action) {
+          case 'read':
+              deliverReadContent(resp);
+              break;
+          case 'download':
+              Swal.fire({
+                  title: '下载地址',
+                  html: '<div id="panList" class="d-flex flex-wrap gap-2"><span class="text-muted">加载中...</span></div>',
+                  showConfirmButton: false,
+                  showCloseButton: true,
+                  allowOutsideClick: false,
+                  allowEscapeKey: false,
+                  didOpen: function () {
+                      renderPanList(resp.downlist, resp?.downpath);
+                  }
+              });
+              break;
+          case 'login':
+              showLoginModal(resp.msg || '请先登录后下载该资源');
+              break;
+          case 'pay':
+              showPay(resp.msg, resp.fen);
+              break;
+          case 'limit':
+              Swal.fire({ icon: 'warning', title: '今日已达上限', text: resp.msg || '您今日下载次数已用完' });
+              break;
+          case 'noperm':
+              Swal.fire({ icon: 'warning', title: '无下载权限', text: resp.msg || '您当前的会员组无此资源下载权限' });
+              break;
+          default:
+              Swal.fire({ icon: 'warning', title: '提示', text: resp.msg || '未知响应' });
+      }
+  }
+
+  // 渲染网盘列表（后端已全返，前端直接展示），挂载到 SweetAlert2 弹框内的 #panList
+  function renderPanList(list, firstUrl='') {
+      var box = null;
+      var container = Swal.getHtmlContainer();
+      if (container) {
+          box = container.querySelector('#panList');
+      }
+      if (!box) return;
+      box.innerHTML = '';
+      if (!list || !list.length) {
+          if (firstUrl) {
+              box.appendChild($('<a class="btn btn-outline-primary" href="' + firstUrl + '" target="_blank">点击下载</a>')[0]);
+          } else {
+              box.appendChild($('<span class="text-muted">暂无可用下载地址</span>')[0]);
+          }
+          return;
+      }
+      list.forEach(function (item) {
+          box.appendChild($('<a class="btn btn-outline-primary me-2 mb-2" href="' + item.url + '" target="_blank">' + (item.name || '下载') + '</a>')[0]);
+      });
+  }
+
+  // 付费阅读：把全文注入正文区，移除付费墙
+  function deliverReadContent(resp) {
+      var html = resp.html || '';
+      $('#articlePreview').html(html);
+      $('#paywallMask').remove();
+      $('#paywallBox').remove();
+      Swal.close();
+  }
+
+  // 登录提示弹框：替代原生 confirm
+  function showLoginModal(msg) {
+      Swal.fire({
+          icon: 'info',
+          title: '需要登录',
+          text: msg,
+          showCancelButton: true,
+          confirmButtonText: '去登录',
+          cancelButtonText: '取消',
+          reverseButtons: true,
+          allowOutsideClick: false,
+          allowEscapeKey: false
+      }).then(function (r) {
+          if (r.isConfirmed) window.open('/e/member/login/', '_blank','noopener,noreferrer');
+      });
+  }
+
+  // 支付弹框：自定义两个按钮，点按钮不关弹框，只有右上角叉号能关
+  function showPay(msg, fen) {
+      var tip  = msg || '需付费下载';
+      Swal.fire({
+          icon: 'warning',
+          title: '需要' + fen + '积分',
+          html:
+              '<div id="payTip" style="margin-bottom:1rem;">' + tip + '</div>' +
+              '<div id="payActions" class="d-flex justify-content-center gap-2">' +
+                  '<button type="button" id="btnPayQr"  class="btn btn-success">付费下载</button>' +
+                  '<button type="button" id="btnPayVip" class="btn btn-danger">查看VIP权限</button>' +
+              '</div>' +
+              '<div id="payQrBox" style="display:none;margin-top:1rem;text-align:center;"></div>',
+          showConfirmButton: false,
+          showCancelButton: false,
+          showCloseButton: true,
+          allowOutsideClick: false,
+          allowEscapeKey: false,
+          didClose: function () {
+              // 用户点右上角叉号关闭弹窗时，停止后台支付结果轮询
+              if (payPollTimer) { clearInterval(payPollTimer); payPollTimer = null; }
+          },
+          didOpen: function () {
+              var c = Swal.getHtmlContainer();
+              if (!c) return;
+              // 查看VIP权限：新标签页打开，弹框保持打开
+              c.querySelector('#btnPayVip').addEventListener('click', function () {
+                  window.open('/x-a-page/vip.html', '_blank', 'noopener,noreferrer');
+              });
+              // 付费下载：请求后端生成支付订单 → 动态渲染二维码，弹框保持打开
+              c.querySelector('#btnPayQr').addEventListener('click', function () {
+                  var qrBox = c.querySelector('#payQrBox');
+                  var actionsBox = c.querySelector('#payActions');
+
+                  // 已经加载过二维码，直接展示（避免重复请求）
+                  if (qrBox.dataset.loaded === '1') {
+                      qrBox.style.display = 'block';
+                      actionsBox.style.display = 'none';
+                      return;
+                  }
+
+                  // 首次加载：显示加载动画，隐藏按钮
+                  qrBox.innerHTML = '<p class="text-muted py-3"><span class="spinner-border spinner-border-sm me-2"></span>正在生成支付二维码...</p>';
+                  qrBox.style.display = 'block';
+                  actionsBox.style.display = 'none';
+
+                  $.ajax({
+                      url: '/e/extend/pay/index.php?action=' + (currentPayMode === 'read' ? 'create_read' : 'create'),
+                      type: 'post',
+                      data: { dataval: currentDataVal },
+                      dataType: 'json'
+                  }).done(function (resp) {
+                      if (resp.success && resp.payUrl) {
+                          qrBox.dataset.loaded = '1';
+                          var channelName = resp.channel_name || '微信';
+                          qrBox.innerHTML =
+                              '<div id="qrPayContainer" style="display:inline-block;max-width:220px;width:100%;border:1px solid #eee;border-radius:8px;padding:8px;background:#fff;"></div>' +
+                              '<p class="text-muted mt-2 mb-0" style="font-size:.85rem;">请使用' + channelName + '扫码支付</p>' +
+                              '<p class="text-muted" style="font-size:.8rem;">虚拟资源由于可复制，一经售出，不支持退款，介意请勿支付</p>';
+                          try {
+                              new QRCode(document.getElementById('qrPayContainer'), {
+                                  text: resp.payUrl,
+                                  width: 220,
+                                  height: 220,
+                                  colorDark: '#000000',
+                                  colorLight: '#ffffff',
+                                  correctLevel: QRCode.CorrectLevel.L
+                              });
+                          } catch(e) {
+                              qrBox.innerHTML = '<p class="text-danger">二维码生成失败：' + e.message + '</p>';
+                          }
+                          // 开始轮询支付结果
+                          if (resp.orderNo) {
+                              startPayPoll(resp.orderNo);
+                          }
+                      } else {
+                          qrBox.innerHTML = '<p class="text-danger">' + (resp.msg || '创建支付订单失败，请稍后重试') + '</p>';
+                      }
+                  }).fail(function () {
+                      qrBox.innerHTML = '<p class="text-danger">网络请求失败，请稍后重试</p>';
+                  });
+              });
+          }
+      });
+  }
+
+  // 轮询支付结果，支付成功后自动获取下载地址
+  function startPayPoll(orderNo) {
+      if (payPollTimer) { clearInterval(payPollTimer); payPollTimer = null; }
+      var maxPolls = 45; // 最多90秒
+      var pollCount = 0;
+      payPollTimer = setInterval(function () {
+          pollCount++;
+          if (pollCount > maxPolls) {
+              clearInterval(payPollTimer);
+              payPollTimer = null;
+              return;
+          }
+          $.getJSON('/e/extend/pay/index.php?action=query&orderNo=' + encodeURIComponent(orderNo))
+           .done(function (r) {
+              if (r.success && r.order && r.order.status == 1) {
+                  clearInterval(payPollTimer);
+                  payPollTimer = null;
+                  if (currentPayMode === 'read') {
+                      // 阅读订单：请求 payread 返回全文
+                      $.ajax({
+                          url: '/e/extend/payread/index.php',
+                          type: 'post',
+                          data: { action: 'paid', orderNo: orderNo },
+                          dataType: 'json'
+                      }).done(function (dr) {
+                          if (dr.success && dr.action === 'read') {
+                              Swal.close();
+                              deliverReadContent(dr);
+                          } else {
+                              Swal.fire({ icon: 'error', title: '提示', text: dr.msg || '获取全文失败' });
+                          }
+                      }).fail(function () {
+                          Swal.fire({ icon: 'error', title: '提示', text: '网络错误，请重试' });
+                      });
+                  } else {
+                      // 下载订单：请求 download 返回网盘地址
+                      $.ajax({
+                          url: '/e/extend/download/index.php',
+                          type: 'post',
+                          data: { action: 'paid', orderNo: orderNo },
+                          dataType: 'json'
+                      }).done(function (dr) {
+                          if (dr.success && dr.action === 'download') {
+                              Swal.close();
+                              Swal.fire({
+                                  title: '下载地址',
+                                  html: '<div id="panList" class="d-flex flex-wrap gap-2"><span class="text-muted">加载中...</span></div>',
+                                  showConfirmButton: false,
+                                  showCloseButton: true,
+                                  allowOutsideClick: false,
+                                  allowEscapeKey: false,
+                                  didOpen: function () {
+                                      renderPanList(dr.downlist);
+                                  }
+                              });
+                          } else {
+                              Swal.fire({ icon: 'error', title: '提示', text: dr.msg || '获取下载地址失败' });
+                          }
+                      }).fail(function () {
+                          Swal.fire({ icon: 'error', title: '提示', text: '网络错误，请重试' });
+                      });
+                  }
+              }
+          });
+      }, 2000);
+  }
+});
